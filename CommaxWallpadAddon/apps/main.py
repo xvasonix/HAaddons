@@ -433,7 +433,7 @@ class WallpadController:
         except Exception as err:
             self.logger.error(f'기기 재시작 프로세스 전체 오류: {str(err)}')
 
-async def process_queue(self) -> None:
+    async def process_queue(self) -> None:
         """비동기 명령 처리: 큐의 명령을 전송하고 대기 목록으로 이동, 대기 목록의 응답 확인"""
         current_time = time.time()
         
