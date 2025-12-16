@@ -433,79 +433,95 @@ class WallpadController:
         except Exception as err:
             self.logger.error(f'기기 재시작 프로세스 전체 오류: {str(err)}')
 
-    async def process_queue(self) -> None:
-        """큐에 있는 모든 명령을 처리하고 예상되는 응답을 확인합니다."""
-        max_send_count = self.max_send_count
-        if not self.QUEUE:
-            return
+async def process_queue(self) -> None:
+        """비동기 명령 처리: 큐의 명령을 전송하고 대기 목록으로 이동, 대기 목록의 응답 확인"""
+        current_time = time.time()
         
-        send_data = self.QUEUE.pop(0)
+        # [Phase 1] 큐의 명령 전송 (배치 처리)
+        # 한 번에 보낼 명령 수 제한 (기본값 5)
+        send_count = 0
+        max_batch_size = 5
         
-        try:
-            cmd_bytes = bytes.fromhex(send_data['sendcmd'])
-            self.publish_mqtt(f'{self.ELFIN_TOPIC}/send', cmd_bytes)
-            send_data['count'] += 1
-        except (ValueError, TypeError) as e:
-            self.logger.error(f"명령 전송 중 오류 발생: {str(e)}")
+        while self.QUEUE and send_count < max_batch_size:
+            item = self.QUEUE.pop(0)
+            try:
+                # 1. 명령 전송
+                cmd_bytes = bytes.fromhex(item['sendcmd'])
+                self.publish_mqtt(f'{self.ELFIN_TOPIC}/send', cmd_bytes)
+                
+                # 2. 메타데이터 업데이트 (전송 시간 기록)
+                item['count'] += 1
+                item['last_send_time'] = current_time
+                
+                # 3. 응답 대기가 필요한 경우 pending 리스트로 이동
+                if item.get('expected_state'):
+                    self.pending_responses.append(item)
+                else:
+                    self.logger.debug(f"전송 완료 (응답 대기 없음): {item['sendcmd']}")
+                
+                send_count += 1
+                
+                # 4. 전송 간 최소 간격 (기기 부하 방지용, 0.05초~0.1초 권장)
+                await asyncio.sleep(0.05) 
+                
+            except Exception as e:
+                self.logger.error(f"명령 전송 중 오류 발생: {str(e)}")
+
+        # [Phase 2] 대기 중인 응답 확인
+        if not self.pending_responses:
+            # 대기 중인 것이 없으면 수신 버퍼 비우기 (불필요한 데이터 누적 방지)
+            self.COLLECTDATA['recent_recv_data'].clear()
             return
+
+        # 수신된 데이터 복사 후 원본 초기화 (이번 루프에서 처리할 데이터)
+        recv_data_list = list(self.COLLECTDATA['recent_recv_data'])
+        self.COLLECTDATA['recent_recv_data'].clear() 
+        
+        # 리스트를 안전하게 수정하기 위해 역순으로 순회
+        for i in range(len(self.pending_responses) - 1, -1, -1):
+            item = self.pending_responses[i]
+            expected = item['expected_state']
             
-        expected_state = send_data.get('expected_state')
-        if (isinstance(expected_state, dict)):
+            match_found = False
             
-            required_bytes = expected_state['required_bytes']
-            possible_values = expected_state['possible_values']
-            
-            recv_data_set = self.COLLECTDATA['recent_recv_data']
-            for received_packet in recv_data_set:
-                if not isinstance(received_packet, str):
+            # 수신 데이터 중에서 매칭되는 것이 있는지 확인
+            for packet in recv_data_list:
+                try:
+                    recv_bytes = bytes.fromhex(packet)
+                    required_bytes = expected['required_bytes']
+                    possible_values = expected['possible_values']
+
+                    is_match = True
+                    for pos in required_bytes:
+                        if len(recv_bytes) <= pos:
+                            is_match = False
+                            break
+                        val = byte_to_hex_str(recv_bytes[pos])
+                        if possible_values[pos] and val not in possible_values[pos]:
+                            is_match = False
+                            break
+                    
+                    if is_match:
+                        item['received_count'] += 1
+                        match_found = True
+                        break # 매칭되는 패킷 하나 찾으면 루프 탈출
+                except Exception:
                     continue
 
-                try:
-                    received_bytes = bytes.fromhex(received_packet)
-                except ValueError:
-                    continue
-                match = True
-                try:
-                    for pos in required_bytes:
-                        if not isinstance(pos, int):
-                            self.logger.error(f"패킷 비교 중 오류 발생: {pos}는 정수가 아닙니다.")
-                            match = False
-                            break
-                        if len(received_bytes) <= pos:
-                            self.logger.error(f"패킷 비교 중 오류 발생: {pos}는 바이트 배열의 길이보다 큽니다.")
-                            match = False
-                            break
-                            
-                        if possible_values[pos]:
-                            if byte_to_hex_str(received_bytes[pos]) not in possible_values[pos]:
-                                match = False
-                                break
-                            
-                except (IndexError, TypeError) as e:
-                    self.logger.error(f"패킷 비교 중 오류 발생: {str(e)}")
-                    match = False
-                    
-                if match:
-                    send_data['received_count'] += 1
-                    self.COLLECTDATA['recent_recv_data'] = set()
-                    self.logger.debug(f"예상된 응답을 수신했습니다 ({send_data['received_count']}/{self.min_receive_count}): {received_packet}")
-                    
-            if send_data['received_count'] >= self.min_receive_count:
-                return
-            
-            if send_data['count'] < max_send_count:
-                self.logger.debug(f"명령 재전송 예약 (시도 {send_data['count']}/{max_send_count}): {send_data['sendcmd']}")
-                self.QUEUE.insert(0, send_data)
+            if match_found:
+                if item['received_count'] >= self.min_receive_count:
+                    self.logger.debug(f"응답 확인 완료 ({item['received_count']}회): {item['sendcmd']}")
+                    self.pending_responses.pop(i) # 완료된 항목 제거
             else:
-                self.logger.warning(f"최대 전송 횟수 초과. 응답을 받지 못했습니다: {send_data['sendcmd']}")
-                    
-        # 예상 상태 정보가 없거나 잘못된 경우 재전송 시도만 함.
-        else:
-            if send_data['count'] < max_send_count:
-                self.logger.debug(f"명령 전송 (횟수 {send_data['count']}/{max_send_count}): {send_data['sendcmd']}")
-                self.QUEUE.insert(0, send_data)
-        
-        await asyncio.sleep(0.05)
+                # 타임아웃 체크 (0.8초 동안 응답 없으면 재전송)
+                if current_time - item.get('last_send_time', 0) > 0.8:
+                    if item['count'] < self.max_send_count:
+                        self.logger.debug(f"응답 시간 초과, 재전송 큐로 이동: {item['sendcmd']}")
+                        self.pending_responses.pop(i)
+                        self.QUEUE.insert(0, item) # 큐 맨 앞에 다시 추가
+                    else:
+                        self.logger.warning(f"응답 실패 (최대 재전송 초과): {item['sendcmd']}")
+                        self.pending_responses.pop(i)
 
     async def process_queue_and_monitor(self) -> None:
         """
