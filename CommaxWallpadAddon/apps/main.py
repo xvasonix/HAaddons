@@ -526,17 +526,9 @@ class WallpadController:
     async def process_queue_and_monitor(self) -> None:
         """
         메시지 큐를 처리하고 기기 상태를 모니터링하는 함수입니다.
-
-        1. 큐에 있는 메시지 처리 (130ms 이상 통신이 없을 때)
-        2. ew11 기기 상태 모니터링 및 필요시 재시작
-
-        Args:
-            elfin_reboot_interval (int): ew11 기기 재시작 판단을 위한 통신 제한 시간 (초)
-
-        Raises:
-            Exception: 큐 처리 또는 기기 재시작 중 오류 발생시 예외를 발생시킵니다.
         """
         try:
+            # 1. EW11 기기 상태 모니터링 (응답 없음 감지 로직)
             elfin_reboot_interval = self.config['elfin'].get('elfin_reboot_interval', 60)
             current_time = time.time_ns()
             last_recv = self.COLLECTDATA['last_recv_time']
@@ -549,11 +541,12 @@ class WallpadController:
                 if (self.config['elfin'].get("use_auto_reboot",True)):
                     self.logger.warning(f'EW11 재시작을 시도합니다. {self.elfin_reboot_count}')
                     await self.reboot_elfin_device()
-            if (self.send_command_on_idle):
-                if signal_interval > 130: #130ms이상 여유있을 때 큐 실행
-                    await self.process_queue()
-            else:
-                await self.process_queue()
+
+            # 2. 큐 처리 (수정됨)
+            # 기존의 send_command_on_idle(130ms 대기) 조건을 제거하고,
+            # 큐에 명령이 있다면 즉시 처리하도록 변경합니다.
+            await self.process_queue()
+            
             return
             
         except Exception as err:
