@@ -1,8 +1,8 @@
 {
-  "name": "COMMAX Wallpad Addon by ew11-mqtt",
+  "name": "COMMAX Wallpad Addon by ew11-mqtt (mod by Devnix)",
   "version": "1.7.0",
   "slug": "commax",
-  "url": "https://github.com/wooooooooooook/HAaddons",
+  "url": "https://github.com/xvasonix/HAaddons",
   "description": "mqtt 통신을 활용한 코맥스 월패드 컨트롤러",
   "arch": ["armhf", "armv7", "aarch64", "amd64", "i386"],
   "map": [
