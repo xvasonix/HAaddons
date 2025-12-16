@@ -437,19 +437,47 @@ class WallpadController:
         """비동기 명령 처리: 큐의 명령을 전송하고 대기 목록으로 이동, 대기 목록의 응답 확인"""
         current_time = time.time()
         
+        # [Helper] 로그용 기기 정보 파싱 함수
+        def get_log_info(packet_hex: str) -> str:
+            header = packet_hex[:2]
+            dev_name = "알수없음"
+            dev_id = ""
+            
+            if self.DEVICE_STRUCTURE:
+                for name, info in self.DEVICE_STRUCTURE.items():
+                    if 'command' in info and info['command']['header'] == header:
+                        # 기기 이름 한글 매핑
+                        name_map = {
+                            'Thermo': '온도조절기', 'Light': '조명', 'LightBreaker': '일괄소등',
+                            'Outlet': '콘센트', 'Gas': '가스', 'Fan': '환기', 'EV': '엘리베이터'
+                        }
+                        dev_name = name_map.get(name, name)
+                        
+                        # 기기 번호(ID) 추출
+                        if 'fieldPositions' in info['command']:
+                            pos_map = info['command']['fieldPositions']
+                            if 'deviceId' in pos_map:
+                                pos = int(pos_map['deviceId'])
+                                # 16진수 문자열에서 해당 바이트 위치 추출 및 10진수 변환
+                                if len(packet_hex) >= pos * 2 + 2:
+                                    dev_id = str(int(packet_hex[pos*2 : pos*2+2], 16)) + "번"
+                        break
+            return f"[{dev_name} {dev_id}]"
+
         # [Phase 1] 큐의 명령 전송 (배치 처리)
-        # 한 번에 보낼 명령 수 제한 (기본값 5)
         send_count = 0
         max_batch_size = 5
         
         while self.QUEUE and send_count < max_batch_size:
             item = self.QUEUE.pop(0)
+            log_info = get_log_info(item['sendcmd']) # 로그 정보 미리 생성
+            
             try:
                 # 1. 명령 전송
                 cmd_bytes = bytes.fromhex(item['sendcmd'])
                 self.publish_mqtt(f'{self.ELFIN_TOPIC}/send', cmd_bytes)
                 
-                # 2. 메타데이터 업데이트 (전송 시간 기록)
+                # 2. 메타데이터 업데이트
                 item['count'] += 1
                 item['last_send_time'] = current_time
                 
@@ -457,23 +485,22 @@ class WallpadController:
                 if item.get('expected_state'):
                     self.pending_responses.append(item)
                 else:
-                    self.logger.debug(f"전송 완료 (응답 대기 없음): {item['sendcmd']}")
+                    self.logger.debug(f"{log_info} 전송 완료 (응답 대기 없음)")
                 
                 send_count += 1
                 
-                # 4. 전송 간 최소 간격 (기기 부하 방지용, 0.05초~0.1초 권장)
+                # 4. 전송 간 최소 간격
                 await asyncio.sleep(0.05) 
                 
             except Exception as e:
-                self.logger.error(f"명령 전송 중 오류 발생: {str(e)}")
+                self.logger.error(f"{log_info} 명령 전송 중 오류 발생: {str(e)}")
 
         # [Phase 2] 대기 중인 응답 확인
         if not self.pending_responses:
-            # 대기 중인 것이 없으면 수신 버퍼 비우기 (불필요한 데이터 누적 방지)
             self.COLLECTDATA['recent_recv_data'].clear()
             return
 
-        # 수신된 데이터 복사 후 원본 초기화 (이번 루프에서 처리할 데이터)
+        # 수신된 데이터 복사 후 원본 초기화
         recv_data_list = list(self.COLLECTDATA['recent_recv_data'])
         self.COLLECTDATA['recent_recv_data'].clear() 
         
@@ -481,10 +508,11 @@ class WallpadController:
         for i in range(len(self.pending_responses) - 1, -1, -1):
             item = self.pending_responses[i]
             expected = item['expected_state']
+            log_info = get_log_info(item['sendcmd']) # 로그 정보 생성
             
             match_found = False
             
-            # 수신 데이터 중에서 매칭되는 것이 있는지 확인
+            # 수신 데이터 매칭 확인
             for packet in recv_data_list:
                 try:
                     recv_bytes = bytes.fromhex(packet)
@@ -504,23 +532,26 @@ class WallpadController:
                     if is_match:
                         item['received_count'] += 1
                         match_found = True
-                        break # 매칭되는 패킷 하나 찾으면 루프 탈출
+                        break 
                 except Exception:
                     continue
 
             if match_found:
+                # 응답 수신 성공 로그
+                self.logger.debug(f"{log_info} 응답 수신 ({item['received_count']}/{self.min_receive_count}회)")
+                
                 if item['received_count'] >= self.min_receive_count:
-                    self.logger.debug(f"응답 확인 완료 ({item['received_count']}회): {item['sendcmd']}")
+                    self.logger.info(f"{log_info} 명령 처리 완료")
                     self.pending_responses.pop(i) # 완료된 항목 제거
             else:
-                # 타임아웃 체크 (0.8초 동안 응답 없으면 재전송)
+                # 타임아웃 체크 (0.8초)
                 if current_time - item.get('last_send_time', 0) > 0.8:
                     if item['count'] < self.max_send_count:
-                        self.logger.debug(f"응답 시간 초과, 재전송 큐로 이동: {item['sendcmd']}")
+                        self.logger.warning(f"{log_info} 응답 대기 시간 초과 -> 재전송 시도 ({item['count']}/{self.max_send_count}회)")
                         self.pending_responses.pop(i)
-                        self.QUEUE.insert(0, item) # 큐 맨 앞에 다시 추가
+                        self.QUEUE.insert(0, item) # 재전송을 위해 큐 맨 앞에 추가
                     else:
-                        self.logger.warning(f"응답 실패 (최대 재전송 초과): {item['sendcmd']}")
+                        self.logger.error(f"{log_info} 전송 실패 (최대 재전송 횟수 {self.max_send_count}회 초과)")
                         self.pending_responses.pop(i)
 
     async def process_queue_and_monitor(self) -> None:
