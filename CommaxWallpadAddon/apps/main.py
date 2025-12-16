@@ -94,6 +94,9 @@ class WallpadController:
         self.state_updater = StateUpdater(self.STATE_TOPIC, self.publish_mqtt)
         self.is_available: bool = False
 
+        # [추가] 응답 대기 중인 명령을 관리할 리스트
+        self.pending_responses: List[Dict[str, Any]] = []
+
     def load_devices_and_packets_structures(self) -> None:
         """
         기기 및 패킷 구조를 로드하는 함수
